@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-hri200-parrot.py - papegojtest for HRI-200.
+hri200-parrot.py - parrot test for HRI-200.
 
-Testar hela kedjan i ett svep: RX-audio, COS-detektering, PTT och TX-audio.
-Vantar pa att squelchen oppnar, spelar in, och sander tillbaka inspelningen
-nar squelchen stanger igen.
+Tests the entire chain in one go: RX audio, COS detection, PTT, and TX audio.
+Waits for the squelch to open, records audio, and plays the recording back
+when the squelch closes again.
 
     sudo apt install -y python3-serial alsa-utils
     sudo python3 hri200-parrot.py --freq 433.500
-    sudo python3 hri200-parrot.py --freq 444.600 --force    # utanfor bandet
+    sudo python3 hri200-parrot.py --freq 444.600 --force    # out-of-band
     sudo python3 hri200-parrot.py --freq 433.500 --card codec --tail 1.5
 
-FORUTSATTNINGAR
-    * Flash-brytaren i NORMALLAGE (lsusb -> 26aa:0002 + 26aa:0003)
-    * Radion i HRI-200-nodlage: [D/X] + [GM] vid paslag, displayen visar HRI-200
-    * DUMMYLAST och lagsta uteffekt
-    * Frekvenser utanfor 144-146 / 430-440 MHz kraver --force och en
-      MARS-modifierad radio. Med dummylast gar ingenting ut i etern.
+PREREQUISITES
+    * Flash switch in NORMAL mode (lsusb -> 26aa:0002 + 26aa:0003)
+    * Radio in HRI-200 node mode: [D/X] + [GM] at power-on, display shows HRI-200
+    * DUMMY LOAD and lowest power output setting
+    * Frequencies outside 144-146 / 430-440 MHz require --force and a
+      MARS-modified radio. With a dummy load, nothing goes out on the air.
 
-PROTOKOLL
-    Ramning   SOH(0x01) <ASCII> EOT(0x04)
-    M00       handskakning, obligatorisk
-    D1M....   frekvenssattning (ej persistent - satts vid varje start)
-    P010000   poll, PTT AV        P100000   poll, PTT PA
-    B<n>...   pollsvar, <n> = squelch
-    D1P0004vv statuspush, bit 0x10 = RX, bit 0x20 = TX (vardet ar sista 2 tecken)
+PROTOCOL
+    Framing   SOH(0x01) <ASCII> EOT(0x04)
+    M00       handshake, mandatory
+    D1M....   frequency setting (non-persistent - set on each startup)
+    P010000   poll, PTT OFF       P100000   poll, PTT ON
+    B<n>...   poll response, <n> = squelch
+    D1P0004vv status push, bit 0x10 = RX, bit 0x20 = TX (value is last 2 chars)
 """
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -82,8 +83,8 @@ def build_freq(mhz, force=False):
 
 class HRI:
     def __init__(self, port):
-        # DTR/RTS laga fore open - annars resettas MCU:n och radion
-        # startar om och tappar frekvensen.
+        # Keep DTR/RTS low before opening - otherwise the MCU resets,
+        # the radio restarts, and loses its frequency setting.
         self.ser = serial.Serial()
         self.ser.port = port
         self.ser.baudrate = BAUD
@@ -132,10 +133,10 @@ class HRI:
     def set_ptt(self, on):
         if on != self.ptt:
             self.ptt = on
-            self.poll()          # skicka direkt, vanta inte pa schemat
+            self.poll()          # Send immediately, do not wait for schedule
 
     def update(self):
-        """Pumpar ramar. Returnerar True om squelchen andrade tillstand."""
+        """Pumps frames. Returns True if the squelch state changed."""
         changed = False
         for f in self.frames():
             new = None
@@ -150,6 +151,14 @@ class HRI:
                 self.sql = new
                 changed = True
         return changed
+
+    def flush_input(self):
+        """Flushes everything currently stored in the serial input buffer."""
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        self.buf.clear()
 
     def close(self):
         try:
@@ -199,14 +208,15 @@ def handshake(h, freq_cmd):
 
 
 class Recorder:
-    """arecord i bakgrunden, rakt till wav."""
+    """Runs arecord in the background, outputting directly to a WAV file."""
     def __init__(self, card, path):
         self.card, self.path, self.proc = card, path, None
 
     def start(self):
         self.proc = subprocess.Popen(
             ["arecord", "-D", f"plughw:CARD={self.card},DEV=0",
-             "-f", "S16_LE", "-r", str(RATE), "-c", "1", "-q", self.path],
+             "-f", "S16_LE", "-r", str(RATE), "-c", "1", "-q",
+             "--buffer-time=100000", self.path],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -240,11 +250,11 @@ def main():
     ap.add_argument("--freq", type=float, required=True)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--tail", type=float, default=1.0,
-                    help="sekunder efter COS-stangning innan atersandning")
+                    help="seconds after COS closing before retransmitting")
     ap.add_argument("--min", type=float, default=0.4,
-                    help="kortare inspelningar an sa har kastas")
+                    help="recordings shorter than this threshold are discarded")
     ap.add_argument("--max", type=float, default=60.0,
-                    help="tvangsstopp av inspelning efter sa har lang tid")
+                    help="force stop recording after this time limit")
     ap.add_argument("-h", "--help", action="help")
     a = ap.parse_args()
 
@@ -263,7 +273,7 @@ def main():
     rec = Recorder(a.card, wav)
 
     print(f"\n=== Papegoja aktiv ===")
-    print(f"  ljudkort : {a.card}     efterslap: {a.tail:.1f} s")
+    print(f"  ljudkort : {a.card}      efterslap: {a.tail:.1f} s")
     print(f"  Sand nagot pa {a.freq:.4f} MHz. Ctrl-C avslutar.\n")
 
     recording = False
@@ -310,16 +320,16 @@ def main():
                 n += 1
                 print(f"{C_TX}  Atersander {dur:.1f} s ...{C_OFF}")
                 h.set_ptt(True)
-                time.sleep(0.25)                 # lat sandaren komma upp
+                time.sleep(0.25)                 # Allow transmitter time to power up
                 play(a.card, wav)
                 time.sleep(0.15)
                 h.set_ptt(False)
                 ok(f"Klart (#{n})")
                 next_poll = time.monotonic()
 
-                # kasta bort det som kom in medan vi sande
+                # Discard data received during TX to avoid false squelch triggers
                 time.sleep(0.3)
-                h.frames()
+                h.flush_input()
                 h.sql = False
 
             time.sleep(0.02)
